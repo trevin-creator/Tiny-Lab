@@ -1,0 +1,7 @@
+name: mlx-5min
+backend: mlx
+wall_clock_minutes: 5
+metric: val_bpb
+max_total_seconds: 330
+default_command_hint: python3 train.py --steps 120 --eval-every 20 --save-every 20 --checkpoint-out tiny_weights.bin
+notes: Use for the shipped single-machine MLX example unless a question explicitly overrides the budget.

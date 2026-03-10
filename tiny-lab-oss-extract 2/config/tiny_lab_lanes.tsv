@@ -1,0 +1,2 @@
+# target|machine|protocol|host|workdir|backend|lane|mode|capabilities
+tiny-gpu|local|file|local|examples/mlx|mlx|gpu|search|Shipped single-machine MLX example lane

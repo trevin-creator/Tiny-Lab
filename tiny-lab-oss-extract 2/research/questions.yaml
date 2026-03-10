@@ -1,0 +1,15 @@
+- id: Q0.1
+  question: "Can the shipped MLX example trainer produce a valid checkpoint that both evaluators can score?"
+  depends_on: []
+  resolved_by: [EXP-001]
+  answer: "Yes. The public baseline run produced a valid checkpoint, and NumPy / MLX evaluation matched with 0.0% delta."
+
+- id: Q1.1
+  question: "Does lowering the learning rate from 0.02 to 0.01 improve best validation bpb after 120 steps?"
+  depends_on: [Q0.1]
+  resolved_by: []
+
+- id: Q1.2
+  question: "Does reducing model width from dim=64 to dim=32 keep the example smaller without hurting best validation bpb too much?"
+  depends_on: [Q0.1]
+  resolved_by: []

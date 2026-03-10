@@ -1,0 +1,5 @@
+# surfaces.txt — legacy single-target registry
+# Format: name | protocol | host | work_dir | capabilities
+#
+# tiny-lab 2.0 ships lane definitions in `config/tiny_lab_lanes.tsv`.
+# Keep this file only for extra legacy/manual targets you add locally.

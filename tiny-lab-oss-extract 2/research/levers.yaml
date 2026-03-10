@@ -1,0 +1,5 @@
+learning_rate: [0.01, 0.02, 0.03]
+dim: [32, 64, 96]
+batch_size: [64, 128, 256]
+steps: [60, 120, 200]
+save_every: [10, 20]

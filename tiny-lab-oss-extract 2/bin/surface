@@ -1,0 +1,2090 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import signal
+import sqlite3
+import subprocess
+import sys
+import textwrap
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+FRESH_STATE_SECONDS = 180
+STATUS_POLL_SECONDS = 2.0
+STOP_WAIT_SECONDS = 6.0
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
+RUNNING_STATES = {"launching", "running", "stopping"}
+BOARD_PATH = Path("protocol/board.json")
+DEFAULT_LANES_PATH = Path("config/tiny_lab_lanes.tsv")
+
+INSPECT_SNIPPET = r"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+backend = os.environ.get("TL_BACKEND", "")
+lane = os.environ.get("TL_LANE", "")
+mode = os.environ.get("TL_MODE", "")
+target_id = os.environ.get("TL_TARGET_ID", "")
+machine = os.environ.get("TL_MACHINE", target_id)
+fresh_seconds = int(os.environ.get("TL_FRESH_SECONDS", "180"))
+
+cwd = Path.cwd()
+now = time.time()
+
+def now_iso():
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+def pid_alive(pid):
+    try:
+        if pid in (None, "", 0):
+            return False
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+def read_text(path):
+    try:
+        return Path(path).read_text()
+    except Exception:
+        return ""
+
+def read_json(path):
+    try:
+        return json.loads(Path(path).read_text())
+    except Exception:
+        return None
+
+def parse_kv(text):
+    out = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        out[key.strip()] = value.strip()
+    return out
+
+def latest_results_row(path):
+    try:
+        rows = [line.rstrip("\n") for line in Path(path).read_text().splitlines() if line.strip()]
+        if len(rows) < 2:
+            return {}
+        header = rows[0].split("\t")
+        values = rows[-1].split("\t")
+        return dict(zip(header, values))
+    except Exception:
+        return {}
+
+def top_level_links():
+    names = ["steering.txt", "steering_status.txt", "steering_events.log", "run_state.txt"]
+    items = {}
+    for name in names:
+        path = cwd / name
+        exists = path.exists() or path.is_symlink()
+        items[name] = {
+            "exists": exists,
+            "is_symlink": path.is_symlink(),
+            "path": str(path),
+            "target": str(path.resolve()) if path.is_symlink() else "",
+            "mtime": path.lstat().st_mtime if exists else None,
+        }
+    return items
+
+def managed_runs():
+    runs_dir = cwd / "runs"
+    items = []
+    if not runs_dir.exists():
+        return items
+    for manifest_path in sorted(
+        runs_dir.glob("*/run.json"),
+        key=lambda candidate: candidate.stat().st_mtime,
+        reverse=True,
+    ):
+        run_dir = manifest_path.parent
+        manifest = read_json(manifest_path) or {}
+        state_path = Path(manifest.get("state_path") or (run_dir / "state.json"))
+        state = read_json(state_path) or {}
+        run_state = parse_kv(read_text(run_dir / "run_state.txt"))
+        steering = parse_kv(read_text(run_dir / "steering_status.txt"))
+        pid = manifest.get("session_id") or manifest.get("pid")
+        live = pid_alive(pid)
+        linked_paths = manifest.get("linked_paths") or {}
+        state_exists = state_path.exists()
+        state_mtime = state_path.stat().st_mtime if state_exists else None
+        state_fresh = bool(state_exists and (now - state_mtime <= fresh_seconds))
+        status = manifest.get("status") or state.get("status") or run_state.get("status") or "unknown"
+        items.append(
+            {
+                "run_name": manifest.get("run_name") or run_dir.name,
+                "run_dir": str(run_dir),
+                "manifest_path": str(manifest_path),
+                "state_path": str(state_path),
+                "manifest": manifest,
+                "state": state,
+                "run_state": run_state,
+                "steering": steering,
+                "live": live,
+                "state_fresh": state_fresh,
+                "state_mtime": state_mtime,
+                "status": status,
+                "pid": manifest.get("pid"),
+                "child_pid": manifest.get("child_pid"),
+                "session_id": manifest.get("session_id"),
+                "owner": manifest.get("owner"),
+                "backend": manifest.get("backend"),
+                "lane": manifest.get("lane"),
+                "mode": manifest.get("mode"),
+                "command": manifest.get("command", ""),
+                "linked_paths": linked_paths,
+                "started_at": manifest.get("started_at"),
+                "ended_at": manifest.get("ended_at") or state.get("ended_at") or run_state.get("ended_at"),
+            }
+        )
+    return items
+
+def legacy_status():
+    root_links = top_level_links()
+    steering = parse_kv(read_text(cwd / "steering_status.txt"))
+    run_state = parse_kv(read_text(cwd / "run_state.txt"))
+    mlx_results = latest_results_row(cwd / "results.tsv") if backend == "mlx" else {}
+    run_log_path = cwd / "run.log"
+    return {
+        "exists": any(item["exists"] for item in root_links.values()) or bool(mlx_results) or run_log_path.exists(),
+        "links": root_links,
+        "steering": steering,
+        "run_state": run_state,
+        "results": mlx_results,
+        "run_log_exists": run_log_path.exists(),
+        "run_log_mtime": run_log_path.stat().st_mtime if run_log_path.exists() else None,
+    }
+
+def untracked_processes(excluded):
+    if backend == "ane":
+        pattern = re.compile(r"(?:^|/)(train_tiny|train_mps|demo_live_train)(?:\s|$)")
+    elif backend == "mlx":
+        pattern = re.compile(r"(uv run train\.py|python3? .*train\.py)")
+    else:
+        return []
+    result = subprocess.run(["ps", "-Ao", "pid=,ppid=,command="], capture_output=True, text=True, check=False)
+    items = []
+    for raw in result.stdout.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid = int(parts[0])
+        if pid in excluded or pid == os.getpid():
+            continue
+        command = parts[2]
+        if "bin/surface" in command or "surface run" in command:
+            continue
+        if not pattern.search(command):
+            continue
+        items.append({"pid": pid, "command": command, "detected_at": now_iso()})
+    return items
+
+runs = managed_runs()
+active = runs[0] if runs else None
+live_runs = [run for run in runs if run["live"]]
+excluded = {
+    int(run["pid"])
+    for run in runs
+    if str(run.get("pid") or "").isdigit()
+}
+excluded.update(
+    int(run["session_id"])
+    for run in runs
+    if str(run.get("session_id") or "").isdigit()
+)
+excluded.update(
+    int(run["child_pid"])
+    for run in runs
+    if str(run.get("child_pid") or "").isdigit()
+)
+
+payload = {
+    "target": target_id,
+    "machine": machine,
+    "backend": backend,
+    "lane": lane,
+    "mode": mode,
+    "cwd": str(cwd),
+    "managed_runs": runs,
+    "active_run": active,
+    "live_run_count": len(live_runs),
+    "legacy": legacy_status(),
+    "untracked": untracked_processes(excluded),
+    "inspected_at": now_iso(),
+}
+print(json.dumps(payload))
+"""
+
+LAUNCH_SNIPPET = r'''
+import json
+import os
+import subprocess
+import sys
+import textwrap
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+def shlex_quote(value):
+    import shlex
+
+    return shlex.quote(value)
+
+cwd = Path.cwd()
+run_name = os.environ["TL_RUN_NAME"]
+target_id = os.environ["TL_TARGET_ID"]
+machine = os.environ["TL_MACHINE"]
+backend = os.environ["TL_BACKEND"]
+lane = os.environ["TL_LANE"]
+mode = os.environ["TL_MODE"]
+owner = os.environ["TL_OWNER"]
+source_tag = os.environ.get("TL_SOURCE_TAG", "manual")
+command = os.environ["TL_COMMAND"]
+auto_restart = "1" if os.environ.get("TL_AUTO_RESTART", "0") == "1" else "0"
+max_restarts = os.environ.get("TL_MAX_RESTARTS", "10")
+eval_on_checkpoint = os.environ.get("TL_EVAL_ON_CHECKPOINT", "")
+stop_token = os.environ.get("TL_STOP_TOKEN") or uuid.uuid4().hex
+auto_directives = os.environ.get("TL_AUTO_DIRECTIVES", "")
+workdir = cwd
+runs_dir = workdir / "runs"
+runs_dir.mkdir(parents=True, exist_ok=True)
+run_dir = runs_dir / run_name
+run_dir.mkdir(parents=True, exist_ok=False)
+
+run_log = run_dir / "run.log"
+steering_events = run_dir / "steering_events.log"
+steering_path = run_dir / "steering.txt"
+state_path = run_dir / "state.json"
+manifest_path = run_dir / "run.json"
+run_state_path = run_dir / "run_state.txt"
+status_path = run_dir / "steering_status.txt"
+
+run_log.touch()
+steering_events.touch()
+steering_path.write_text(auto_directives)
+run_state_path.write_text("status=launching\n")
+status_path.write_text(
+    "step=0\nloss=0\nval_accuracy=0\nlr=0\naccum_steps=0\nms_step=0\nelapsed_s=0\nbest_val=0\nbest_step=0\n"
+)
+
+linked_paths = {}
+link_names = ["steering.txt", "steering_status.txt", "steering_events.log", "run_state.txt"] if backend == "ane" else []
+for name in link_names:
+    top_level = workdir / name
+    if top_level.exists() or top_level.is_symlink():
+        stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+        stale_name = top_level.with_name(f"{top_level.name}.stale-{stamp}")
+        top_level.rename(stale_name)
+    top_level.symlink_to(Path("runs") / run_name / name)
+    linked_paths[name] = str(top_level)
+
+manifest = {
+    "run_name": run_name,
+    "target": target_id,
+    "machine": machine,
+    "lane": lane,
+    "backend": backend,
+    "owner": owner,
+    "session_id": None,
+    "pid": None,
+    "child_pid": None,
+    "mode": "managed",
+    "lane_mode": mode,
+    "source_tag": source_tag,
+    "command": command,
+    "cwd": str(workdir),
+    "run_dir": str(run_dir),
+    "state_path": str(state_path),
+    "manifest_path": str(manifest_path),
+    "stop_token": stop_token,
+    "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    "status": "launching",
+    "auto_restart": auto_restart == "1",
+    "max_restarts": int(max_restarts),
+    "eval_on_checkpoint": eval_on_checkpoint,
+    "linked_paths": linked_paths,
+}
+manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+state_path.write_text(
+    json.dumps(
+        {
+            "target": target_id,
+            "machine": machine,
+            "lane": lane,
+            "backend": backend,
+            "owner": owner,
+            "status": "launching",
+            "live": False,
+            "heartbeat_at": manifest["started_at"],
+            "source": "launch",
+            "run_name": run_name,
+            "run_dir": str(run_dir),
+        },
+        indent=2,
+        sort_keys=True,
+    )
+    + "\n"
+)
+
+wrapper_path = run_dir / ".tiny_lab_runner.sh"
+wrapper = textwrap.dedent(
+    f"""\
+    #!/bin/bash
+    set -euo pipefail
+
+    RUN_DIR={shlex_quote(str(run_dir))}
+    RUN_NAME={shlex_quote(run_name)}
+    TARGET_ID={shlex_quote(target_id)}
+    MACHINE={shlex_quote(machine)}
+    BACKEND={shlex_quote(backend)}
+    LANE={shlex_quote(lane)}
+    LANE_MODE={shlex_quote(mode)}
+    OWNER={shlex_quote(owner)}
+    SOURCE_TAG={shlex_quote(source_tag)}
+    STOP_TOKEN={shlex_quote(stop_token)}
+    AUTO_RESTART={auto_restart}
+    MAX_RESTARTS={max_restarts}
+    EVAL_ON_CHECKPOINT={shlex_quote(eval_on_checkpoint)}
+    LINKED_JSON={shlex_quote(json.dumps(linked_paths))}
+    STATE_PATH={shlex_quote(str(state_path))}
+    MANIFEST_PATH={shlex_quote(str(manifest_path))}
+    RUN_LOG={shlex_quote(str(run_log))}
+    EVENTS_PATH={shlex_quote(str(steering_events))}
+    STEERING_PATH={shlex_quote(str(steering_path))}
+    RUN_STATE_PATH={shlex_quote(str(run_state_path))}
+    STATUS_PATH={shlex_quote(str(status_path))}
+    COMMAND={shlex_quote(command)}
+    ROOT_DIR={shlex_quote(os.environ.get("TL_ROOT", ""))}
+    WORKDIR={shlex_quote(os.environ.get("TL_WORKDIR", str(workdir)))}
+    COMMAND_SHELL={shlex_quote(os.environ.get("TL_LOCAL_SHELL", "/bin/bash"))}
+
+    now_iso() {{
+      python3 - <<'PY'
+from datetime import datetime
+print(datetime.now().astimezone().isoformat(timespec="seconds"))
+PY
+    }}
+
+    parse_steering_json() {{
+      python3 - "$STATUS_PATH" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = {{}}
+if path.exists():
+    for raw in path.read_text().splitlines():
+        if "=" not in raw:
+            continue
+        key, value = raw.split("=", 1)
+        payload[key.strip()] = value.strip()
+print(json.dumps(payload))
+PY
+    }}
+
+    write_state() {{
+      local status="$1"
+      local live="$2"
+      local child_pid="${{3:-}}"
+      local ended_at="${{4:-}}"
+      local source="$5"
+      local restart_count="${{6:-0}}"
+      local steering_json
+      steering_json="$(parse_steering_json)"
+      TL_STATUS="$status" \\
+      TL_LIVE="$live" \\
+      TL_CHILD_PID="$child_pid" \\
+      TL_ENDED_AT="$ended_at" \\
+      TL_SOURCE="$source" \\
+      TL_RESTART_COUNT="$restart_count" \\
+      TL_STATE_PATH="$STATE_PATH" \\
+      TL_MANIFEST_PATH="$MANIFEST_PATH" \\
+      TL_RUN_DIR="$RUN_DIR" \\
+      TL_RUN_NAME="$RUN_NAME" \\
+      TL_TARGET_ID="$TARGET_ID" \\
+      TL_MACHINE="$MACHINE" \\
+      TL_BACKEND="$BACKEND" \\
+      TL_LANE="$LANE" \\
+      TL_LANE_MODE="$LANE_MODE" \\
+      TL_OWNER="$OWNER" \\
+      TL_SOURCE_TAG="$SOURCE_TAG" \\
+      TL_STOP_TOKEN="$STOP_TOKEN" \\
+      TL_COMMAND="$COMMAND" \\
+      TL_LINKED_JSON="$LINKED_JSON" \\
+      TL_STEERING_JSON="$steering_json" \\
+      python3 - <<'PY'
+import json
+import os
+from datetime import datetime
+from pathlib import Path
+
+state_path = Path(os.environ["TL_STATE_PATH"])
+manifest_path = Path(os.environ["TL_MANIFEST_PATH"])
+state = {{}}
+manifest = {{}}
+if state_path.exists():
+    try:
+        state = json.loads(state_path.read_text())
+    except Exception:
+        state = {{}}
+if manifest_path.exists():
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except Exception:
+        manifest = {{}}
+
+metrics = json.loads(os.environ.get("TL_STEERING_JSON") or "{{}}")
+heartbeat = datetime.now().astimezone().isoformat(timespec="seconds")
+state.update(
+    {{
+        "target": os.environ["TL_TARGET_ID"],
+        "machine": os.environ["TL_MACHINE"],
+        "lane": os.environ["TL_LANE"],
+        "lane_mode": os.environ["TL_LANE_MODE"],
+        "backend": os.environ["TL_BACKEND"],
+        "owner": os.environ["TL_OWNER"],
+        "status": os.environ["TL_STATUS"],
+        "live": os.environ["TL_LIVE"] == "1",
+        "heartbeat_at": heartbeat,
+        "source": os.environ["TL_SOURCE"],
+        "run_name": os.environ["TL_RUN_NAME"],
+        "run_dir": os.environ["TL_RUN_DIR"],
+        "pid": manifest.get("pid"),
+        "child_pid": os.environ.get("TL_CHILD_PID") or manifest.get("child_pid"),
+        "session_id": manifest.get("session_id"),
+        "restart_count": int(os.environ.get("TL_RESTART_COUNT", "0")),
+        "stop_token": os.environ["TL_STOP_TOKEN"],
+        "source_tag": os.environ.get("TL_SOURCE_TAG", "manual"),
+    }}
+)
+if os.environ.get("TL_ENDED_AT"):
+    state["ended_at"] = os.environ["TL_ENDED_AT"]
+for key, value in metrics.items():
+    state[key] = value
+state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\\n")
+
+manifest.update(
+    {{
+        "status": os.environ["TL_STATUS"],
+        "ended_at": os.environ.get("TL_ENDED_AT") or manifest.get("ended_at"),
+        "backend": os.environ["TL_BACKEND"],
+        "lane": os.environ["TL_LANE"],
+        "lane_mode": os.environ["TL_LANE_MODE"],
+        "owner": os.environ["TL_OWNER"],
+        "command": os.environ["TL_COMMAND"],
+        "run_dir": os.environ["TL_RUN_DIR"],
+        "state_path": str(state_path),
+        "manifest_path": str(manifest_path),
+        "stop_token": os.environ["TL_STOP_TOKEN"],
+        "linked_paths": json.loads(os.environ.get("TL_LINKED_JSON") or "{{}}"),
+        "restart_count": int(os.environ.get("TL_RESTART_COUNT", "0")),
+        "source_tag": os.environ.get("TL_SOURCE_TAG", "manual"),
+    }}
+)
+manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\\n")
+PY
+    }}
+
+    cleanup_links() {{
+      RUN_DIR="$RUN_DIR" LINKED_JSON="$LINKED_JSON" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+run_dir = Path(os.environ["RUN_DIR"])
+linked = json.loads(os.environ.get("LINKED_JSON") or "{{}}")
+for _, raw_path in linked.items():
+    path = Path(raw_path)
+    if not (path.exists() or path.is_symlink()):
+        continue
+    if path.is_symlink():
+        try:
+            if path.resolve().parent == run_dir:
+                path.unlink()
+        except Exception:
+            pass
+PY
+    }}
+
+    eval_new_checkpoints() {{
+      [ -n "$EVAL_ON_CHECKPOINT" ] || return 0
+      [ -f "$RUN_DIR/.last_eval" ] || touch "$RUN_DIR/.last_eval"
+      local eval_script="$EVAL_ON_CHECKPOINT"
+      if [ "${{eval_script#/}}" = "$eval_script" ]; then
+        eval_script="$ROOT_DIR/$eval_script"
+      fi
+      while IFS= read -r checkpoint; do
+        [ -n "$checkpoint" ] || continue
+        python3 "$eval_script" --checkpoint "$checkpoint" --tokenizer "$ROOT_DIR/ane/primitives/bpe_vocab_512.bin" --eval-bundle "$ROOT_DIR/ane/eval_bundle" --out "${{checkpoint%.bin}}_eval.json" >>"$RUN_LOG" 2>&1 || true
+      done < <(find "$RUN_DIR" -name 'checkpoint_*.bin' -newer "$RUN_DIR/.last_eval" -o -name 'tiny_weights.bin' -newer "$RUN_DIR/.last_eval" 2>/dev/null)
+      touch "$RUN_DIR/.last_eval"
+    }}
+
+    printf 'status=running\n' >"$RUN_STATE_PATH"
+    write_state "running" "1" "" "" "launch" "0"
+
+    runner_pid=$$
+    session_id="$runner_pid"
+    RUNNER_PID="$runner_pid" SESSION_ID="$session_id" MANIFEST_PATH="$MANIFEST_PATH" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+manifest_path = Path(os.environ["MANIFEST_PATH"])
+manifest = json.loads(manifest_path.read_text())
+manifest["pid"] = int(os.environ["RUNNER_PID"])
+manifest["session_id"] = int(os.environ["SESSION_ID"])
+manifest["status"] = "running"
+manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\\n")
+PY
+
+    restarts=0
+    last_step=""
+    same_step=0
+    term_requested=0
+    worker_pid=""
+    exit_code=0
+
+    on_term() {{
+      term_requested=1
+      printf '%s early_stop=1 source=signal\n' "$(now_iso)" >>"$EVENTS_PATH"
+      printf 'early_stop=1\n' >>"$STEERING_PATH"
+      [ -n "$worker_pid" ] && kill "$worker_pid" 2>/dev/null || true
+    }}
+    trap on_term TERM INT
+
+    monitor_worker() {{
+      local pid="$1"
+      while kill -0 "$pid" 2>/dev/null; do
+        write_state "running" "1" "$pid" "" "process" "$restarts"
+        sleep 2
+      done
+    }}
+
+    stop_requested() {{
+      grep -Eq '(^|[[:space:]])early_stop=1($|[[:space:]])' "$STEERING_PATH" "$EVENTS_PATH" 2>/dev/null
+    }}
+
+    while true; do
+      export TINY_LAB_ROOT="$ROOT_DIR"
+      export TINY_LAB_WORKDIR="$WORKDIR"
+      export TINY_LAB_RUN_DIR="$RUN_DIR"
+      export TINY_LAB_RUN_NAME="$RUN_NAME"
+      export TINY_LAB_TARGET="$TARGET_ID"
+      export TINY_LAB_MACHINE="$MACHINE"
+      export TINY_LAB_BACKEND="$BACKEND"
+      export TINY_LAB_LANE="$LANE"
+      export TINY_LAB_LANE_MODE="$LANE_MODE"
+      export TINY_LAB_STEERING_PATH="$STEERING_PATH"
+      export TINY_LAB_STATUS_PATH="$STATUS_PATH"
+      export TINY_LAB_RUN_STATE_PATH="$RUN_STATE_PATH"
+      "$COMMAND_SHELL" -lc "$COMMAND" >>"$RUN_LOG" 2>&1 &
+      worker_pid=$!
+      WORKER_PID="$worker_pid" MANIFEST_PATH="$MANIFEST_PATH" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+manifest_path = Path(os.environ["MANIFEST_PATH"])
+manifest = json.loads(manifest_path.read_text())
+manifest["child_pid"] = int(os.environ["WORKER_PID"])
+manifest["status"] = "running"
+manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\\n")
+PY
+      monitor_worker "$worker_pid" &
+      monitor_pid=$!
+      wait "$worker_pid"
+      exit_code=$?
+      wait "$monitor_pid" || true
+      eval_new_checkpoints
+
+      if [ "$exit_code" -eq 0 ] || stop_requested || [ "$term_requested" -eq 1 ]; then
+        break
+      fi
+      if [ "$AUTO_RESTART" != "1" ]; then
+        break
+      fi
+      restarts=$((restarts + 1))
+      if [ "$restarts" -ge "$MAX_RESTARTS" ]; then
+        printf '%s auto_restart_limit=%s\n' "$(now_iso)" "$MAX_RESTARTS" >>"$EVENTS_PATH"
+        break
+      fi
+      current_step="$(python3 - "$STATUS_PATH" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+step = ""
+if path.exists():
+    for raw in path.read_text().splitlines():
+        if raw.startswith("step="):
+            step = raw.split("=", 1)[1].strip()
+            break
+print(step)
+PY
+)"
+      if [ -n "$current_step" ] && [ "$current_step" = "$last_step" ]; then
+        same_step=$((same_step + 1))
+      else
+        same_step=0
+        last_step="$current_step"
+      fi
+      if [ "$same_step" -ge 3 ]; then
+        printf '%s same_step_restart_guard=%s\n' "$(now_iso)" "$current_step" >>"$EVENTS_PATH"
+        break
+      fi
+      printf '%s restart=%s exit_code=%s step=%s\n' "$(now_iso)" "$restarts" "$exit_code" "${{current_step:-?}}" >>"$EVENTS_PATH"
+      sleep 2
+    done
+
+    ended_at="$(now_iso)"
+    final_status="crashed"
+    if stop_requested || [ "$term_requested" -eq 1 ]; then
+      final_status="stopped"
+    elif [ "$exit_code" -eq 0 ]; then
+      final_status="completed"
+    fi
+    printf 'status=%s\nexit_code=%s\nrestart_count=%s\nended_at=%s\n' "$final_status" "$exit_code" "$restarts" "$ended_at" >"$RUN_STATE_PATH"
+    write_state "$final_status" "0" "$worker_pid" "$ended_at" "final" "$restarts"
+    cleanup_links
+    exit "$exit_code"
+    """
+)
+
+wrapper_path.write_text(wrapper)
+wrapper_path.chmod(0o755)
+process = subprocess.Popen(
+    ["bash", str(wrapper_path)],
+    cwd=str(workdir),
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    start_new_session=True,
+)
+
+manifest["pid"] = process.pid
+manifest["session_id"] = process.pid
+manifest["status"] = "running"
+manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+state = json.loads(state_path.read_text())
+state["status"] = "running"
+state["live"] = True
+state["source"] = "launch"
+state["pid"] = process.pid
+state["session_id"] = process.pid
+state["heartbeat_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+print(
+    json.dumps(
+        {
+            "run_name": run_name,
+            "run_dir": str(run_dir),
+            "manifest_path": str(manifest_path),
+            "state_path": str(state_path),
+            "pid": process.pid,
+            "session_id": process.pid,
+            "linked_paths": linked_paths,
+            "stop_token": stop_token,
+        }
+    )
+)
+'''
+
+STOP_SNIPPET = r"""
+import json
+import os
+import signal
+import time
+from datetime import datetime
+from pathlib import Path
+
+run_name = os.environ["TL_RUN_NAME"]
+force = os.environ.get("TL_FORCE", "0") == "1"
+wait_seconds = float(os.environ.get("TL_STOP_WAIT", "6"))
+
+cwd = Path.cwd()
+run_dir = cwd / "runs" / run_name
+manifest_path = run_dir / "run.json"
+state_path = run_dir / "state.json"
+run_state_path = run_dir / "run_state.txt"
+steering_path = run_dir / "steering.txt"
+events_path = run_dir / "steering_events.log"
+
+def now_iso():
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+def load_json(path):
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+def save_json(path, payload):
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+def pid_alive(pid):
+    try:
+        if pid in (None, "", 0):
+            return False
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+manifest = load_json(manifest_path)
+state = load_json(state_path)
+session_id = manifest.get("session_id") or manifest.get("pid")
+actions = []
+
+if steering_path.exists():
+    with steering_path.open("a") as handle:
+        handle.write("early_stop=1\n")
+    with events_path.open("a") as handle:
+        handle.write(f"{now_iso()} early_stop=1 source=surface-stop\n")
+    actions.append("wrote early_stop=1")
+
+deadline = time.time() + wait_seconds
+while pid_alive(session_id) and time.time() < deadline and not force:
+    time.sleep(0.5)
+
+killed = False
+if pid_alive(session_id):
+    try:
+        os.killpg(int(session_id), signal.SIGTERM)
+        killed = True
+        actions.append("sent SIGTERM to process group")
+    except Exception:
+        try:
+            os.kill(int(session_id), signal.SIGTERM)
+            killed = True
+            actions.append("sent SIGTERM to pid")
+        except Exception:
+            actions.append("failed to send SIGTERM")
+    end = time.time() + 2.0
+    while pid_alive(session_id) and time.time() < end:
+        time.sleep(0.25)
+    if pid_alive(session_id):
+        try:
+            os.killpg(int(session_id), signal.SIGKILL)
+            actions.append("sent SIGKILL to process group")
+        except Exception:
+            try:
+                os.kill(int(session_id), signal.SIGKILL)
+                actions.append("sent SIGKILL to pid")
+            except Exception:
+                actions.append("failed to send SIGKILL")
+
+ended_at = now_iso()
+manifest["status"] = "stopped"
+manifest["ended_at"] = ended_at
+state["status"] = "stopped"
+state["live"] = False
+state["ended_at"] = ended_at
+state["heartbeat_at"] = ended_at
+state["source"] = "surface-stop"
+save_json(manifest_path, manifest)
+save_json(state_path, state)
+run_state_path.write_text(f"status=stopped\nexit_code=143\nended_at={ended_at}\n")
+
+for raw_path in (manifest.get("linked_paths") or {}).values():
+    path = Path(raw_path)
+    if not (path.exists() or path.is_symlink()):
+        continue
+    if path.is_symlink():
+        try:
+            if path.resolve().parent == run_dir:
+                path.unlink()
+                actions.append(f"cleared {path.name}")
+        except Exception:
+            pass
+
+print(
+    json.dumps(
+        {
+            "run_name": run_name,
+            "actions": actions,
+            "ended_at": ended_at,
+            "still_live": pid_alive(session_id),
+            "killed": killed,
+        }
+    )
+)
+"""
+
+DOCTOR_FIX_SNIPPET = r"""
+import json
+import os
+from datetime import datetime
+from pathlib import Path
+
+run_name = os.environ.get("TL_RUN_NAME", "")
+fix_links_only = os.environ.get("TL_FIX_LINKS_ONLY", "0") == "1"
+cwd = Path.cwd()
+
+def now_iso():
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+def load_json(path):
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+def save_json(path, payload):
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+actions = []
+
+if run_name:
+    run_dir = cwd / "runs" / run_name
+    manifest_path = run_dir / "run.json"
+    state_path = run_dir / "state.json"
+    run_state_path = run_dir / "run_state.txt"
+    manifest = load_json(manifest_path)
+    state = load_json(state_path)
+    ended_at = now_iso()
+    if manifest:
+        manifest["status"] = "stopped"
+        manifest["ended_at"] = ended_at
+        save_json(manifest_path, manifest)
+        actions.append(f"marked {run_name} stopped in run.json")
+    if state:
+        state["status"] = "stopped"
+        state["live"] = False
+        state["ended_at"] = ended_at
+        state["heartbeat_at"] = ended_at
+        state["source"] = "doctor-fix"
+        save_json(state_path, state)
+        actions.append(f"marked {run_name} stopped in state.json")
+    if run_state_path.exists():
+        run_state_path.write_text(f"status=stopped\nended_at={ended_at}\n")
+        actions.append(f"updated {run_name} run_state.txt")
+    for raw_path in (manifest.get("linked_paths") or {}).values():
+        path = Path(raw_path)
+        if path.is_symlink():
+            try:
+                if path.resolve().parent == run_dir:
+                    path.unlink()
+                    actions.append(f"removed stale link {path.name}")
+            except Exception:
+                pass
+
+if fix_links_only:
+    for name in ["steering.txt", "steering_status.txt", "steering_events.log", "run_state.txt"]:
+        path = cwd / name
+        if path.is_symlink():
+            try:
+                target = path.resolve()
+                if not target.exists():
+                    path.unlink()
+                    actions.append(f"removed dangling link {name}")
+            except Exception:
+                pass
+
+print(json.dumps({"actions": actions}))
+"""
+
+STEER_SNIPPET = r"""
+import json
+import os
+from datetime import datetime
+from pathlib import Path
+
+directive = os.environ["TL_DIRECTIVE"]
+run_name = os.environ.get("TL_RUN_NAME", "")
+cwd = Path.cwd()
+
+if run_name:
+    steering = cwd / "runs" / run_name / "steering.txt"
+    events = cwd / "runs" / run_name / "steering_events.log"
+else:
+    steering = cwd / "steering.txt"
+    events = cwd / "steering_events.log"
+
+steering.parent.mkdir(parents=True, exist_ok=True)
+with steering.open("a") as handle:
+    handle.write(directive + "\n")
+events.parent.mkdir(parents=True, exist_ok=True)
+with events.open("a") as handle:
+    handle.write(f"{datetime.now().astimezone().isoformat(timespec='seconds')} {directive}\n")
+print(json.dumps({"path": str(steering), "directive": directive}))
+"""
+
+
+@dataclass
+class Target:
+    id: str
+    machine: str
+    protocol: str
+    host: str
+    workdir: str
+    backend: str = ""
+    lane: str = ""
+    mode: str = ""
+    capabilities: str = ""
+    legacy: bool = False
+
+    @property
+    def display_name(self) -> str:
+        return self.id
+
+
+def now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def sql_escape(value: str) -> str:
+    return value.replace("'", "''")
+
+
+def sql_num(value: Any) -> str:
+    if value in (None, "", "nan", "NaN", "inf", "-inf"):
+        return "NULL"
+    return str(value)
+
+
+class SurfaceApp:
+    def __init__(self) -> None:
+        root_override = os.environ.get("TINY_LAB_ROOT")
+        self.root = Path(root_override).expanduser() if root_override else Path(__file__).resolve().parents[1]
+        self.registry_path = self.root / "surfaces.txt"
+        self.lanes_path = self.root / DEFAULT_LANES_PATH
+        self.gates_dir = self.root / "gates"
+        self.db_path = self.root / "tiny_lab.db"
+        self.targets, self.machine_index = self._load_targets()
+        self._ensure_db()
+
+    def _ensure_db(self) -> None:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER PRIMARY KEY,
+                    timestamp TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%S','now','localtime')),
+                    surface TEXT,
+                    run_name TEXT,
+                    event_type TEXT,
+                    key TEXT,
+                    value TEXT,
+                    message TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS snapshots (
+                    id INTEGER PRIMARY KEY,
+                    timestamp TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%S','now','localtime')),
+                    surface TEXT,
+                    run_name TEXT,
+                    step INTEGER,
+                    loss REAL,
+                    lr REAL,
+                    val_accuracy REAL,
+                    ms_step REAL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS runs (
+                    id INTEGER PRIMARY KEY,
+                    surface TEXT,
+                    run_name TEXT,
+                    started TEXT,
+                    ended TEXT,
+                    command TEXT,
+                    final_loss REAL,
+                    final_accuracy REAL,
+                    status TEXT,
+                    gates_passed INTEGER,
+                    gates_failed INTEGER
+                )
+                """
+            )
+            existing = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+            required = {
+                "machine": "TEXT",
+                "lane": "TEXT",
+                "backend": "TEXT",
+                "owner": "TEXT",
+                "session_id": "INTEGER",
+                "pid": "INTEGER",
+                "mode": "TEXT",
+                "source_tag": "TEXT",
+                "cwd": "TEXT",
+                "manifest_path": "TEXT",
+                "state_path": "TEXT",
+                "stop_token": "TEXT",
+                "lane_mode": "TEXT",
+            }
+            for column, column_type in required.items():
+                if column not in existing:
+                    try:
+                        conn.execute(f"ALTER TABLE runs ADD COLUMN {column} {column_type}")
+                    except sqlite3.OperationalError as exc:
+                        if "duplicate column name" not in str(exc):
+                            raise
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _load_targets(self) -> tuple[dict[str, Target], dict[str, list[Target]]]:
+        targets: dict[str, Target] = {}
+        machine_index: dict[str, list[Target]] = {}
+        if self.lanes_path.exists():
+            for raw in self.lanes_path.read_text().splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = [part.strip() for part in raw.split("|")]
+                if len(parts) < 9:
+                    continue
+                target = Target(
+                    id=parts[0],
+                    machine=parts[1],
+                    protocol=parts[2],
+                    host=parts[3],
+                    workdir=parts[4],
+                    backend=parts[5],
+                    lane=parts[6],
+                    mode=parts[7],
+                    capabilities=parts[8],
+                )
+                targets[target.id] = target
+                machine_index.setdefault(target.machine, []).append(target)
+
+        lane_machines = set(machine_index)
+        if self.registry_path.exists():
+            for raw in self.registry_path.read_text().splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = [part.strip() for part in raw.split("|")]
+                if len(parts) < 5:
+                    continue
+                name, proto, host, workdir, caps = parts[:5]
+                if name in targets or name in lane_machines:
+                    continue
+                target = Target(
+                    id=name,
+                    machine=name,
+                    protocol=proto,
+                    host=host,
+                    workdir=workdir,
+                    capabilities=caps,
+                    legacy=True,
+                )
+                targets[target.id] = target
+                machine_index.setdefault(target.machine, []).append(target)
+        return targets, machine_index
+
+    def db_execute(self, statement: str, params: tuple[Any, ...] = ()) -> None:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(statement, params)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def db_query(self, statement: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            return list(conn.execute(statement, params))
+        finally:
+            conn.close()
+
+    def db_event(self, surface: str, event_type: str, key: str = "", value: str = "", message: str = "") -> None:
+        self.db_execute(
+            "INSERT INTO events (surface,event_type,key,value,message) VALUES (?,?,?,?,?)",
+            (surface, event_type, key, value, message),
+        )
+
+    def db_snapshot(self, surface: str, run_name: str, step: Any, loss: Any, lr: Any, val_accuracy: Any, ms_step: Any) -> None:
+        self.db_execute(
+            "INSERT INTO snapshots (surface,run_name,step,loss,lr,val_accuracy,ms_step) VALUES (?,?,?,?,?,?,?)",
+            (surface, run_name, step, loss, lr, val_accuracy, ms_step),
+        )
+
+    def latest_db_row(self, target: Target) -> dict[str, Any] | None:
+        rows = self.db_query(
+            "SELECT * FROM runs WHERE surface=? ORDER BY id DESC LIMIT 1",
+            (target.id,),
+        )
+        return dict(rows[0]) if rows else None
+
+    def active_db_rows(self, target: Target) -> list[dict[str, Any]]:
+        rows = self.db_query(
+            "SELECT * FROM runs WHERE surface=? AND status='running' ORDER BY id DESC",
+            (target.id,),
+        )
+        return [dict(row) for row in rows]
+
+    def list_targets(self) -> list[Target]:
+        return [self.targets[key] for key in sorted(self.targets)]
+
+    def resolve_targets(self, name: str, aggregate: bool = False, prefer_default_lane: bool = False) -> list[Target]:
+        if name in ("all", ""):
+            return self.list_targets()
+        if name in self.targets:
+            return [self.targets[name]]
+        if name in self.machine_index:
+            lanes = sorted(self.machine_index[name], key=lambda item: item.id)
+            if aggregate:
+                return lanes
+            if prefer_default_lane:
+                for candidate in lanes:
+                    if candidate.backend == "ane":
+                        return [candidate]
+                return [lanes[0]]
+            return lanes
+        raise SystemExit(f"Unknown surface: {name}")
+
+    def resolved_workdir(self, target: Target) -> str:
+        workdir = Path(target.workdir).expanduser()
+        if target.protocol == "file" and not workdir.is_absolute():
+            workdir = self.root / workdir
+        return str(workdir.resolve())
+
+    def _build_command(self, target: Target, command: str, env: dict[str, str] | None = None) -> str:
+        prefix = f"cd {shlex.quote(self.resolved_workdir(target))} && "
+        if env:
+            env_bits = " ".join(f"{key}={shlex.quote(value)}" for key, value in env.items())
+            prefix += env_bits + " "
+        return prefix + command
+
+    def exec_on_target(
+        self,
+        target: Target,
+        command: str,
+        env: dict[str, str] | None = None,
+        stdin: str | None = None,
+        check: bool = True,
+        timeout: float | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        wrapped = self._build_command(target, command, env)
+        if target.protocol == "ssh":
+            args = ["ssh", *SSH_OPTS, target.host, f"bash -lc {shlex.quote(wrapped)}"]
+        elif target.protocol == "file":
+            args = [os.environ.get("SHELL", "/bin/bash"), "-lc", wrapped]
+        else:
+            raise SystemExit(f"{target.id}: unsupported protocol {target.protocol}")
+        result = subprocess.run(
+            args,
+            input=stdin,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+        if check and result.returncode != 0:
+            stderr = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            raise RuntimeError(f"{target.id}: {stderr}")
+        return result
+
+    def exec_python(self, target: Target, snippet: str, env: dict[str, str], check: bool = True) -> dict[str, Any]:
+        result = self.exec_on_target(target, "python3 -", env=env, stdin=snippet, check=check)
+        output = result.stdout.strip() or "{}"
+        return json.loads(output)
+
+    def inspect_target(self, target: Target) -> dict[str, Any]:
+        if target.protocol == "manual":
+            return {
+                "target": target.id,
+                "machine": target.machine,
+                "backend": target.backend,
+                "lane": target.lane,
+                "mode": target.mode,
+                "managed_runs": [],
+                "active_run": None,
+                "live_run_count": 0,
+                "legacy": {"exists": False, "links": {}, "steering": {}, "run_state": {}, "results": {}},
+                "untracked": [],
+                "inspected_at": now_iso(),
+            }
+        env = {
+            "TL_TARGET_ID": target.id,
+            "TL_MACHINE": target.machine,
+            "TL_BACKEND": target.backend,
+            "TL_LANE": target.lane,
+            "TL_MODE": target.mode,
+            "TL_FRESH_SECONDS": str(FRESH_STATE_SECONDS),
+        }
+        return self.exec_python(target, INSPECT_SNIPPET, env)
+
+    def resolve_truth(self, target: Target) -> dict[str, Any]:
+        inspect = self.inspect_target(target)
+        latest_db = self.latest_db_row(target)
+        active_run = inspect.get("active_run") or {}
+        live_managed = active_run.get("live")
+        state_fresh = bool(active_run.get("state_fresh"))
+        state = active_run.get("state") or {}
+        steering = active_run.get("steering") or {}
+        run_state = active_run.get("run_state") or {}
+        legacy = inspect.get("legacy") or {}
+        legacy_state = legacy.get("run_state") or legacy.get("steering") or {}
+        mode = "idle"
+        source = "none"
+        details = {}
+
+        if active_run and live_managed:
+            source = "live_process"
+            mode = "managed"
+            details = state or steering or run_state
+        elif active_run and state_fresh and state:
+            source = "state_json"
+            mode = "managed"
+            details = state or steering or run_state
+        elif active_run:
+            source = "run_json"
+            mode = "managed" if active_run.get("status") not in ("", "unknown") else "idle"
+            details = run_state or steering or state
+        elif latest_db and latest_db.get("status"):
+            source = "db_row"
+            mode = "managed" if latest_db.get("status") in RUNNING_STATES else "idle"
+            details = {
+                "status": latest_db.get("status"),
+                "final_loss": latest_db.get("final_loss"),
+                "final_accuracy": latest_db.get("final_accuracy"),
+                "run_name": latest_db.get("run_name"),
+            }
+        elif legacy.get("exists"):
+            source = "legacy"
+            mode = "idle"
+            details = legacy_state
+        elif inspect.get("untracked"):
+            source = "live_process"
+            mode = "untracked"
+        status = (
+            active_run.get("status")
+            or state.get("status")
+            or run_state.get("status")
+            or details.get("status")
+            or ("running" if mode == "untracked" else "idle")
+        )
+        if active_run and not live_managed and status in RUNNING_STATES:
+            status = "stale"
+        elif source == "db_row" and status in RUNNING_STATES:
+            status = "stale"
+        if source == "legacy" and not inspect.get("untracked"):
+            status = "idle"
+        metrics = {}
+        for key in ("step", "loss", "lr", "val_accuracy", "ms_step", "best_val", "best_step", "val_bpb", "memory_gb"):
+            if key in state:
+                metrics[key] = state[key]
+            elif key in steering:
+                metrics[key] = steering[key]
+            elif key in details:
+                metrics[key] = details[key]
+        if "step" in metrics:
+            try:
+                self.db_snapshot(
+                    target.id,
+                    active_run.get("run_name", ""),
+                    int(float(metrics.get("step", 0))),
+                    float(metrics.get("loss", 0) or 0),
+                    float(metrics.get("lr", 0) or 0),
+                    float(metrics.get("val_accuracy", 0) or 0),
+                    float(metrics.get("ms_step", 0) or 0),
+                )
+            except Exception:
+                pass
+        return {
+            "target": target,
+            "inspect": inspect,
+            "latest_db": latest_db,
+            "source": source,
+            "mode": mode,
+            "status": status,
+            "metrics": metrics,
+            "active_run": active_run,
+        }
+
+    def run_list(self) -> int:
+        print("SURFACES:")
+        for target in self.list_targets():
+            descriptor = " ".join(filter(None, [target.backend, target.lane, target.mode])).strip()
+            print(f"  {target.id:16s} {target.protocol:6s} {descriptor or target.capabilities}")
+        return 0
+
+    def render_status(self, resolved: dict[str, Any], verbose: bool = False) -> str:
+        target: Target = resolved["target"]
+        inspect = resolved["inspect"]
+        active = resolved["active_run"]
+        metrics = resolved["metrics"]
+        if verbose:
+            lines = [
+                f"target={target.id}",
+                f"machine={target.machine}",
+                f"lane={target.lane or 'none'}",
+                f"backend={target.backend or 'legacy'}",
+                f"lane_mode={target.mode or 'none'}",
+                f"truth_source={resolved['source']}",
+                f"lane_state={resolved['status']}",
+                f"activity={resolved['mode']}",
+                f"untracked_count={len(inspect.get('untracked') or [])}",
+            ]
+            if active:
+                lines.extend(
+                    [
+                        f"run_name={active.get('run_name', '')}",
+                        f"run_dir={active.get('run_dir', '')}",
+                        f"manifest_status={active.get('status', '')}",
+                        f"manifest_owner={active.get('owner', '')}",
+                        f"manifest_pid={active.get('pid', '')}",
+                        f"manifest_child_pid={active.get('child_pid', '')}",
+                        f"manifest_session_id={active.get('session_id', '')}",
+                        f"manifest_path={active.get('manifest_path', '')}",
+                        f"state_path={active.get('state_path', '')}",
+                        f"state_fresh={'yes' if active.get('state_fresh') else 'no'}",
+                        f"live_process={'yes' if active.get('live') else 'no'}",
+                        f"stop_path={'steering+kill' if target.backend == 'ane' else 'session-kill'}",
+                    ]
+                )
+            else:
+                lines.extend(
+                    [
+                        "run_name=",
+                        "run_dir=",
+                        "manifest_status=",
+                        "manifest_owner=",
+                        "manifest_pid=",
+                        "manifest_child_pid=",
+                        "manifest_session_id=",
+                        "manifest_path=",
+                        "state_path=",
+                        "state_fresh=no",
+                        "live_process=no",
+                        "stop_path=none",
+                    ]
+                )
+            for key, value in metrics.items():
+                lines.append(f"{key}={value}")
+            for index, item in enumerate(inspect.get("untracked") or [], start=1):
+                lines.append(f"untracked_{index}_pid={item.get('pid')}")
+                lines.append(f"untracked_{index}_command={item.get('command')}")
+            return "\n".join(lines)
+        if resolved["mode"] == "managed" and active:
+            if resolved["status"] in RUNNING_STATES:
+                headline = f"status=running managed=yes run={active.get('run_name','')}"
+            else:
+                headline = f"status={resolved['status']} managed=yes last_run={active.get('run_name','')}"
+        elif resolved["mode"] == "untracked":
+            headline = "status=running managed=no"
+        else:
+            headline = f"status={resolved['status']} managed=no"
+        pieces = [headline, f"truth={resolved['source']}"]
+        if "step" in metrics:
+            pieces.append(f"step={metrics['step']}")
+        if "loss" in metrics:
+            pieces.append(f"loss={metrics['loss']}")
+        if target.backend:
+            pieces.append(f"backend={target.backend}")
+        if target.mode:
+            pieces.append(f"mode={target.mode}")
+        if inspect.get("untracked"):
+            pieces.append(f"untracked={len(inspect['untracked'])}")
+        return " ".join(pieces)
+
+    def run_status(self, name: str, verbose: bool = False) -> int:
+        aggregate = name not in ("", "all") and name not in self.targets
+        targets = self.resolve_targets(name or "all", aggregate=aggregate)
+        for index, target in enumerate(targets):
+            resolved = self.resolve_truth(target)
+            if len(targets) > 1:
+                print(f"=== {target.id} ===")
+            print(self.render_status(resolved, verbose=verbose))
+            if len(targets) > 1 and index != len(targets) - 1:
+                print()
+        return 0
+
+    def _slugify(self, value: str) -> str:
+        slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+        return slug or "run"
+
+    def _default_run_name(self, command: str, label: str = "") -> str:
+        if label:
+            stem = self._slugify(label)
+        else:
+            tokens = [token for token in shlex.split(command) if "=" not in token]
+            stem = self._slugify(tokens[-1] if tokens else "run")
+        return f"{stem}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+
+    def run_run(self, surface_name: str, command: str, args: argparse.Namespace) -> int:
+        target = self.resolve_targets(surface_name, prefer_default_lane=True)[0]
+        resolved = self.resolve_truth(target)
+        if resolved["mode"] == "managed" and resolved["status"] in RUNNING_STATES:
+            raise SystemExit(f"{target.id}: managed run already active ({resolved['active_run'].get('run_name')})")
+        if resolved["mode"] == "untracked":
+            raise SystemExit(f"{target.id}: untracked process already active; use doctor/status first")
+
+        run_name = self._default_run_name(command, args.name or "")
+        owner = os.environ.get("SURFACE_OWNER", "local-session")
+        source_tag = getattr(args, "source_tag", None) or os.environ.get("SURFACE_SOURCE_TAG", "manual")
+        env = {
+            "TL_RUN_NAME": run_name,
+            "TL_TARGET_ID": target.id,
+            "TL_MACHINE": target.machine,
+            "TL_BACKEND": target.backend,
+            "TL_LANE": target.lane,
+            "TL_MODE": target.mode,
+            "TL_OWNER": owner,
+            "TL_SOURCE_TAG": source_tag,
+            "TL_COMMAND": command,
+            "TL_ROOT": str(self.root),
+            "TL_WORKDIR": self.resolved_workdir(target),
+            "TL_LOCAL_SHELL": os.environ.get("SHELL", "/bin/bash"),
+            "TL_AUTO_RESTART": "1" if args.auto_restart else "0",
+            "TL_MAX_RESTARTS": str(args.max_restarts),
+            "TL_EVAL_ON_CHECKPOINT": args.eval_on_checkpoint or "",
+            "TL_STOP_TOKEN": uuid.uuid4().hex,
+            "TL_AUTO_DIRECTIVES": "".join(f"{item}\n" for item in args.auto),
+        }
+        launch = self.exec_python(target, LAUNCH_SNIPPET, env)
+        started = now_iso()
+        self.db_execute(
+            """
+            INSERT INTO runs (
+                surface, run_name, started, command, status, machine, lane, backend,
+                owner, session_id, pid, mode, source_tag, cwd, manifest_path,
+                state_path, stop_token, lane_mode
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                target.id,
+                run_name,
+                started,
+                command,
+                "running",
+                target.machine,
+                target.lane,
+                target.backend,
+                owner,
+                launch.get("session_id"),
+                launch.get("pid"),
+                "managed",
+                source_tag,
+                self.resolved_workdir(target),
+                launch.get("manifest_path"),
+                launch.get("state_path"),
+                launch.get("stop_token"),
+                target.mode,
+            ),
+        )
+        print(f"[{target.id}] launched {run_name} pid={launch.get('pid')} session={launch.get('session_id')}")
+        try:
+            final = self.wait_for_completion(target, run_name)
+        except KeyboardInterrupt:
+            print(f"[{target.id}] detached from {run_name}")
+            return 130
+        metrics = final["metrics"]
+        self.finalize_run_db(target, run_name, final)
+        print(f"Run complete: {run_name} on {target.id}")
+        status = final["status"]
+        summary = [f"Status: {status}", f"Truth: {final['source']}"]
+        if "loss" in metrics:
+            summary.append(f"Loss: {metrics['loss']}")
+        if "val_accuracy" in metrics:
+            summary.append(f"ValAcc: {metrics['val_accuracy']}")
+        if "step" in metrics:
+            summary.append(f"Step: {metrics['step']}")
+        print(" | ".join(summary))
+        return 0 if status != "crashed" else 1
+
+    def wait_for_completion(self, target: Target, run_name: str) -> dict[str, Any]:
+        while True:
+            resolved = self.resolve_truth(target)
+            active = resolved["active_run"]
+            if active and active.get("run_name") == run_name and resolved["status"] in RUNNING_STATES:
+                time.sleep(STATUS_POLL_SECONDS)
+                continue
+            if active and active.get("run_name") == run_name:
+                return resolved
+            latest = self.latest_db_row(target)
+            if latest and latest.get("run_name") == run_name and latest.get("status") != "running":
+                return resolved
+            if not active:
+                return resolved
+            time.sleep(STATUS_POLL_SECONDS)
+
+    def finalize_run_db(self, target: Target, run_name: str, resolved: dict[str, Any]) -> None:
+        metrics = resolved["metrics"]
+        final_loss = metrics.get("loss") or metrics.get("final_loss")
+        final_acc = metrics.get("val_accuracy") or metrics.get("final_accuracy")
+        status = resolved["status"]
+        self.db_execute(
+            """
+            UPDATE runs
+            SET ended=?, status=?, final_loss=?, final_accuracy=?
+            WHERE surface=? AND run_name=? AND status='running'
+            """,
+            (now_iso(), status, final_loss, final_acc, target.id, run_name),
+        )
+
+    def run_stop(self, surface_name: str, force: bool = False) -> int:
+        target = self.resolve_targets(surface_name, prefer_default_lane=True)[0]
+        resolved = self.resolve_truth(target)
+        active = resolved["active_run"]
+        if not active:
+            print(f"[{target.id}] no managed run found")
+            return 0
+        env = {
+            "TL_RUN_NAME": active["run_name"],
+            "TL_FORCE": "1" if force else "0",
+            "TL_STOP_WAIT": str(STOP_WAIT_SECONDS),
+        }
+        print(f"[{target.id}] stopping {active['run_name']}")
+        result = self.exec_python(target, STOP_SNIPPET, env)
+        self.db_execute(
+            "UPDATE runs SET ended=?, status='stopped' WHERE surface=? AND run_name=? AND status='running'",
+            (result["ended_at"], target.id, active["run_name"]),
+        )
+        for action in result.get("actions", []):
+            print(f"[{target.id}] {action}")
+        if result.get("still_live"):
+            print(f"[{target.id}] process still live after stop attempt")
+            return 1
+        print(f"[{target.id}] stopped {active['run_name']}")
+        return 0
+
+    def run_steer(self, surface_name: str, directive: str) -> int:
+        target = self.resolve_targets(surface_name, prefer_default_lane=True)[0]
+        resolved = self.resolve_truth(target)
+        active = resolved["active_run"]
+        run_name = active.get("run_name") if active else ""
+        payload = self.exec_python(
+            target,
+            STEER_SNIPPET,
+            {"TL_DIRECTIVE": directive, "TL_RUN_NAME": run_name},
+        )
+        key, _, value = directive.partition("=")
+        self.db_event(target.id, "steer", key, value, directive)
+        print(f"[{target.id}] steered: {directive}")
+        print(f"[{target.id}] path: {payload['path']}")
+        return 0
+
+    def run_msg(self, surface_name: str, message: str) -> int:
+        return self.run_steer(surface_name, f"message={message}")
+
+    def run_log(self, surface_name: str, lines: int) -> int:
+        return self.run_tail(surface_name, "steering_events.log", lines)
+
+    def run_tail(self, surface_name: str, filename: str, lines: int) -> int:
+        target = self.resolve_targets(surface_name, prefer_default_lane=True)[0]
+        resolved = self.resolve_truth(target)
+        active = resolved["active_run"]
+        path = filename
+        if active:
+            path = str(Path(active["run_dir"]) / filename)
+        result = self.exec_on_target(target, f"tail -n {int(lines)} {shlex.quote(path)}", check=False)
+        output = result.stdout.strip() or result.stderr.strip() or f"file not found: {path}"
+        print(output)
+        return 0 if result.returncode == 0 else 1
+
+    def run_query(self, statement: str) -> int:
+        rows = self.db_query(statement)
+        if not rows:
+            return 0
+        headers = rows[0].keys()
+        print("  ".join(headers))
+        for row in rows:
+            print("  ".join(str(row[key]) if row[key] is not None else "" for key in headers))
+        return 0
+
+    def run_history(self, surface: str | None) -> int:
+        if surface:
+            rows = self.db_query(
+                "SELECT run_name, started, status, final_loss, final_accuracy FROM runs WHERE surface=? ORDER BY id DESC LIMIT 10",
+                (surface,),
+            )
+        else:
+            rows = self.db_query(
+                "SELECT surface, run_name, started, status, final_loss, final_accuracy FROM runs ORDER BY id DESC LIMIT 10"
+            )
+        if not rows:
+            return 0
+        headers = rows[0].keys()
+        print("  ".join(headers))
+        for row in rows:
+            print("  ".join(str(row[key]) if row[key] is not None else "" for key in headers))
+        return 0
+
+    def run_best(self, limit: int) -> int:
+        rows = self.db_query(
+            "SELECT surface, run_name, final_loss, final_accuracy FROM runs WHERE final_loss IS NOT NULL ORDER BY final_loss ASC LIMIT ?",
+            (limit,),
+        )
+        if not rows:
+            return 0
+        print("surface  run_name  final_loss  final_accuracy")
+        for row in rows:
+            print(f"{row['surface']}  {row['run_name']}  {row['final_loss']}  {row['final_accuracy']}")
+        return 0
+
+    def run_fails(self, days: int) -> int:
+        rows = self.db_query(
+            "SELECT timestamp, surface, key, message FROM events WHERE event_type='gate_fail' AND timestamp > strftime('%Y-%m-%dT%H:%M:%S','now','localtime',?) ORDER BY timestamp DESC",
+            (f"-{days} days",),
+        )
+        if not rows:
+            return 0
+        print("timestamp  surface  key  message")
+        for row in rows:
+            print(f"{row['timestamp']}  {row['surface']}  {row['key']}  {row['message']}")
+        return 0
+
+    def inspect_lock(self) -> dict[str, Any] | None:
+        lock_path = self.root / "research/.research-lock"
+        if not lock_path.exists():
+            return None
+        pid_text = lock_path.read_text().strip() or "0"
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            pid = 0
+        alive = False
+        if pid:
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except OSError:
+                alive = False
+        age_minutes = int((time.time() - lock_path.stat().st_mtime) / 60)
+        return {"path": str(lock_path), "pid": pid, "alive": alive, "age_minutes": age_minutes}
+
+    def doctor_findings(self, target: Target) -> list[dict[str, Any]]:
+        resolved = self.resolve_truth(target)
+        inspect = resolved["inspect"]
+        active = resolved["active_run"]
+        findings: list[dict[str, Any]] = []
+        latest_db = resolved["latest_db"]
+        if latest_db and latest_db.get("status") in RUNNING_STATES and not (active and active.get("live")):
+            findings.append(
+                {
+                    "code": "STALE_DB_ROW",
+                    "severity": "warn",
+                    "detail": f"db says running for {latest_db.get('run_name')} but no live managed process",
+                    "run_name": latest_db.get("run_name"),
+                }
+            )
+        if active and active.get("status") in RUNNING_STATES and not active.get("live"):
+            findings.append(
+                {
+                    "code": "DEAD_RUN",
+                    "severity": "warn",
+                    "detail": f"run.json says {active.get('status')} but pid is dead",
+                    "run_name": active.get("run_name"),
+                }
+            )
+        if active and not latest_db:
+            findings.append(
+                {
+                    "code": "GHOST_RUN",
+                    "severity": "warn",
+                    "detail": f"manifest exists for {active.get('run_name')} but db row is missing",
+                    "run_name": active.get("run_name"),
+                }
+            )
+        if active and (
+            active.get("backend") != target.backend
+            or active.get("lane") != target.lane
+            or not active.get("owner")
+        ):
+            findings.append(
+                {
+                    "code": "OWNER_MISMATCH",
+                    "severity": "warn",
+                    "detail": "manifest owner/backend/lane does not match target",
+                    "run_name": active.get("run_name"),
+                }
+            )
+        if inspect.get("live_run_count", 0) > 1:
+            findings.append(
+                {
+                    "code": "DOUBLE_BOOKING",
+                    "severity": "error",
+                    "detail": f"{inspect['live_run_count']} live managed runs present on one lane",
+                    "run_name": active.get("run_name") if active else "",
+                }
+            )
+        if inspect.get("untracked"):
+            for item in inspect["untracked"]:
+                findings.append(
+                    {
+                        "code": "UNTRACKED_PROCESS",
+                        "severity": "warn",
+                        "detail": f"pid={item['pid']} {item['command']}",
+                        "run_name": "",
+                    }
+                )
+        legacy_links = (inspect.get("legacy") or {}).get("links") or {}
+        if legacy_links:
+            linked_targets = [item for item in legacy_links.values() if item.get("exists")]
+            if linked_targets and not (active and active.get("live")):
+                findings.append(
+                    {
+                        "code": "ORPHAN_STATUS_FILE",
+                        "severity": "warn",
+                        "detail": "top-level status artifacts exist without a live managed run",
+                        "run_name": active.get("run_name") if active else "",
+                    }
+                )
+        if target.backend == "mlx":
+            for name in ("steering.txt", "steering_status.txt", "run_state.txt"):
+                item = legacy_links.get(name, {})
+                if item.get("exists"):
+                    findings.append(
+                        {
+                            "code": "BACKEND_STATUS_BLEED",
+                            "severity": "warn",
+                            "detail": f"mlx lane has ANE raw status artifact {name}",
+                            "run_name": active.get("run_name") if active else "",
+                        }
+                    )
+                    break
+        lock = self.inspect_lock()
+        if lock and (not lock["alive"] or lock["age_minutes"] >= 120):
+            findings.append(
+                {
+                    "code": "STALE_LOCK",
+                    "severity": "warn",
+                    "detail": f"research lock pid={lock['pid']} age={lock['age_minutes']}m",
+                    "run_name": "",
+                }
+            )
+        return findings
+
+    def apply_doctor_fix(self, target: Target, findings: list[dict[str, Any]]) -> list[str]:
+        actions: list[str] = []
+        active_run = self.resolve_truth(target)["active_run"]
+        finding_codes = {finding["code"] for finding in findings}
+        if "STALE_LOCK" in finding_codes:
+            lock = self.root / "research/.research-lock"
+            if lock.exists():
+                lock.unlink()
+                actions.append("removed stale research lock")
+        if "STALE_DB_ROW" in finding_codes:
+            latest = self.latest_db_row(target)
+            if latest and latest.get("status") in RUNNING_STATES:
+                self.db_execute(
+                    "UPDATE runs SET status='stopped', ended=? WHERE surface=? AND run_name=? AND status IN ('launching','running','stopping')",
+                    (now_iso(), target.id, latest["run_name"]),
+                )
+                actions.append(f"updated stale db row {latest['run_name']}")
+        if active_run and {"DEAD_RUN", "GHOST_RUN", "ORPHAN_STATUS_FILE"} & finding_codes:
+            payload = self.exec_python(
+                target,
+                DOCTOR_FIX_SNIPPET,
+                {"TL_RUN_NAME": active_run["run_name"], "TL_FIX_LINKS_ONLY": "1"},
+            )
+            actions.extend(payload.get("actions", []))
+        elif "ORPHAN_STATUS_FILE" in finding_codes:
+            payload = self.exec_python(
+                target,
+                DOCTOR_FIX_SNIPPET,
+                {"TL_RUN_NAME": "", "TL_FIX_LINKS_ONLY": "1"},
+            )
+            actions.extend(payload.get("actions", []))
+        return actions
+
+    def run_doctor(self, name: str, fix: bool = False) -> int:
+        targets = self.resolve_targets(name or "all", aggregate=name not in self.targets and name not in ("all", ""))
+        had_findings = False
+        for index, target in enumerate(targets):
+            findings = self.doctor_findings(target)
+            if len(targets) > 1:
+                print(f"=== {target.id} ===")
+            if not findings:
+                print("OK")
+            else:
+                had_findings = True
+                for finding in findings:
+                    print(f"{finding['code']}: {finding['detail']}")
+                if fix:
+                    actions = self.apply_doctor_fix(target, findings)
+                    for action in actions:
+                        print(f"FIXED: {action}")
+            if len(targets) > 1 and index != len(targets) - 1:
+                print()
+        return 1 if had_findings and not fix else 0
+
+    def board_snapshot(self) -> dict[str, Any]:
+        surfaces: list[dict[str, Any]] = []
+        active_runs: list[dict[str, Any]] = []
+        broken: list[dict[str, Any]] = []
+        for target in self.list_targets():
+            if target.protocol == "manual":
+                surfaces.append({"id": target.id, "kind": target.protocol, "status": "manual"})
+                continue
+            resolved = self.resolve_truth(target)
+            inspect = resolved["inspect"]
+            row = {
+                "id": target.id,
+                "machine": target.machine,
+                "kind": target.protocol,
+                "backend": target.backend,
+                "lane": target.lane,
+                "mode": target.mode,
+                "status": resolved["status"],
+                "activity": resolved["mode"],
+                "source": resolved["source"],
+                "managed": resolved["mode"] == "managed",
+                "untracked": len(inspect.get("untracked") or []),
+            }
+            row.update(resolved["metrics"])
+            active = resolved["active_run"]
+            if active:
+                row["run_name"] = active.get("run_name")
+                row["owner"] = active.get("owner")
+                row["pid"] = active.get("pid")
+            if resolved["mode"] == "managed" and resolved["status"] in RUNNING_STATES and active:
+                active_runs.append(
+                    {
+                        "surface": target.id,
+                        "run_name": active.get("run_name"),
+                        "pid": active.get("pid"),
+                        "status": resolved["status"],
+                    }
+                )
+            if self.doctor_findings(target):
+                for finding in self.doctor_findings(target):
+                    broken.append({"surface": target.id, "code": finding["code"], "detail": finding["detail"]})
+            surfaces.append(row)
+        recent_events = [
+            dict(row)
+            for row in self.db_query(
+                "SELECT timestamp, surface, event_type AS type, key, value FROM events ORDER BY id DESC LIMIT 10"
+            )
+        ]
+        return {
+            "protocol_version": 2,
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "surfaces": surfaces,
+            "active_runs": active_runs,
+            "broken_gates": broken,
+            "recent_events": recent_events,
+        }
+
+    def run_board(self, json_mode: bool = False) -> int:
+        snapshot = self.board_snapshot()
+        board_file = self.root / BOARD_PATH
+        board_file.parent.mkdir(parents=True, exist_ok=True)
+        board_file.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n")
+        if json_mode:
+            print(json.dumps(snapshot, indent=2, sort_keys=True))
+            return 0
+        print(f"═══ TINY-LAB 2.0 BOARD {datetime.now().strftime('%Y-%m-%d %H:%M')} ═══")
+        print("")
+        for item in snapshot["surfaces"]:
+            if item["kind"] == "manual":
+                print(f"  {item['id']:16s} manual")
+                continue
+            if item.get("managed") and item["status"] in RUNNING_STATES:
+                print(
+                    f"  {item['id']:16s} run={item.get('run_name',''):<28s} source={item['source']:<12s} status={item['status']:<9s}"
+                )
+            elif item.get("activity") == "untracked":
+                print(f"  {item['id']:16s} untracked source={item['source']:<12s} count={item.get('untracked',0)}")
+            else:
+                print(f"  {item['id']:16s} {item['status']:<9s} source={item['source']:<12s}")
+        return 0
+
+    def run_check(self, name: str) -> int:
+        targets = self.resolve_targets(name or "all", aggregate=name not in self.targets and name not in ("all", ""))
+        if not self.gates_dir.exists():
+            print("(no gates defined)")
+            return 0
+        overall = 0
+        for index, target in enumerate(targets):
+            if len(targets) > 1:
+                print(f"=== {target.id} ===")
+            gate_files = sorted(self.gates_dir.glob("*.txt"))
+            if not gate_files:
+                print("  (no gates defined)")
+                continue
+            for gate_file in gate_files:
+                for raw in gate_file.read_text().splitlines():
+                    line = raw.strip()
+                    if not line or line.startswith("#") or "|" not in line:
+                        continue
+                    parts = [part.strip() for part in line.split("|", 2)]
+                    if len(parts) != 3:
+                        continue
+                    gate_name, gate_command, gate_expectation = parts
+                    result = self.exec_on_target(target, gate_command, check=False)
+                    output = (result.stdout or "") + (result.stderr or "")
+                    passed = self.evaluate_gate(output, gate_expectation)
+                    status = "PASS" if passed else "FAIL"
+                    print(f"  [{gate_file.name}] {gate_name:<24s} {status}")
+                    self.db_event(target.id, "gate_pass" if passed else "gate_fail", gate_name, status.lower(), gate_file.name)
+                    if not passed:
+                        overall = 1
+            if len(targets) > 1 and index != len(targets) - 1:
+                print()
+        return overall
+
+    def evaluate_gate(self, output: str, expectation: str) -> bool:
+        text = expectation.strip()
+        if text.startswith("contains "):
+            needle = text[len("contains ") :].strip().strip('"')
+            return needle in output
+        if text.startswith("not_contains "):
+            needle = text[len("not_contains ") :].strip().strip('"')
+            return needle not in output
+        if text.startswith("line_count "):
+            expected = int(text[len("line_count ") :].strip())
+            return len([line for line in output.splitlines() if line.strip()]) == expected
+        if text.startswith("== "):
+            return output.strip() == text[3:].strip()
+        return True
+
+    def run_overnight(self) -> int:
+        print(f"═══ OVERNIGHT REPORT {datetime.now().strftime('%Y-%m-%d %H:%M')} ═══")
+        print("")
+        print("── RECENT RUNS ──")
+        self.run_history(None)
+        print("")
+        print("── BOARD ──")
+        self.run_board(json_mode=False)
+        return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="surface")
+    sub = parser.add_subparsers(dest="action")
+
+    sub.add_parser("list")
+
+    status = sub.add_parser("status")
+    status.add_argument("target", nargs="?", default="all")
+    status.add_argument("--verbose", action="store_true")
+
+    steer = sub.add_parser("steer")
+    steer.add_argument("target")
+    steer.add_argument("directive")
+
+    msg = sub.add_parser("msg")
+    msg.add_argument("target")
+    msg.add_argument("message")
+
+    log = sub.add_parser("log")
+    log.add_argument("target")
+    log.add_argument("lines", nargs="?", type=int, default=20)
+
+    tail = sub.add_parser("tail")
+    tail.add_argument("target")
+    tail.add_argument("file", nargs="?", default="steering_status.txt")
+    tail.add_argument("lines", nargs="?", type=int, default=20)
+
+    check = sub.add_parser("check")
+    check.add_argument("target", nargs="?", default="all")
+
+    run = sub.add_parser("run")
+    run.add_argument("target")
+    run.add_argument("command")
+    run.add_argument("--name")
+    run.add_argument("--auto", action="append", default=[])
+    run.add_argument("--auto-restart", action="store_true")
+    run.add_argument("--max-restarts", type=int, default=10)
+    run.add_argument("--eval-on-checkpoint")
+    run.add_argument("--source-tag")
+
+    stop = sub.add_parser("stop")
+    stop.add_argument("target")
+    stop.add_argument("--force", action="store_true")
+
+    doctor = sub.add_parser("doctor")
+    doctor.add_argument("target", nargs="?", default="all")
+    doctor.add_argument("--fix", action="store_true")
+
+    query = sub.add_parser("query")
+    query.add_argument("statement")
+
+    history = sub.add_parser("history")
+    history.add_argument("target", nargs="?")
+
+    best = sub.add_parser("best")
+    best.add_argument("limit", nargs="?", type=int, default=5)
+
+    fails = sub.add_parser("fails")
+    fails.add_argument("days", nargs="?", type=int, default=7)
+
+    overnight = sub.add_parser("overnight")
+
+    board = sub.add_parser("board")
+    board.add_argument("--json", action="store_true")
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.action:
+        parser.print_help()
+        return 1
+    app = SurfaceApp()
+    if args.action == "list":
+        return app.run_list()
+    if args.action == "status":
+        return app.run_status(args.target, verbose=args.verbose)
+    if args.action == "steer":
+        return app.run_steer(args.target, args.directive)
+    if args.action == "msg":
+        return app.run_msg(args.target, args.message)
+    if args.action == "log":
+        return app.run_log(args.target, args.lines)
+    if args.action == "tail":
+        return app.run_tail(args.target, args.file, args.lines)
+    if args.action == "check":
+        return app.run_check(args.target)
+    if args.action == "run":
+        return app.run_run(args.target, args.command, args)
+    if args.action == "stop":
+        return app.run_stop(args.target, force=args.force)
+    if args.action == "doctor":
+        return app.run_doctor(args.target, fix=args.fix)
+    if args.action == "query":
+        return app.run_query(args.statement)
+    if args.action == "history":
+        return app.run_history(args.target)
+    if args.action == "best":
+        return app.run_best(args.limit)
+    if args.action == "fails":
+        return app.run_fails(args.days)
+    if args.action == "overnight":
+        return app.run_overnight()
+    if args.action == "board":
+        return app.run_board(json_mode=args.json)
+    parser.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

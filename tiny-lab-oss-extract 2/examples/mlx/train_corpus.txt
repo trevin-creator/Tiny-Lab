@@ -1,0 +1,48 @@
+Mina liked tiny machines and tiny stories.
+Every morning she opened her notebook and wrote one clear idea.
+Her friend Sol liked to test each idea on a small batch before lunch.
+They trained tiny models on short stories about trains, birds, gardens, and rain.
+When a run worked, they wrote down the command, the score, and the next question.
+When a run failed, they wrote that down too, because a clean failure still teaches something.
+
+One day Mina saw a bright kite above the field.
+The kite dipped low, touched the grass, and rose into the wind again.
+She laughed, took a pencil from her pocket, and wrote a sentence about the kite.
+Sol read the sentence, changed one word, and made it sharper.
+They kept the better sentence and moved on to the next small test.
+
+At night the room was quiet except for keys, fans, and a kettle.
+The kettle clicked, the fans hummed, and the keys made a dry steady rhythm.
+Mina said that good tools should be small enough to understand in one sitting.
+Sol agreed and said a tool should show its work without forcing a user to guess.
+So they made a habit: one command, one change, one result, one note.
+
+A brown dog slept under the desk while the models trained.
+When a run finished, the dog woke up, stretched, and tapped the floor with its tail.
+Mina saved the checkpoint.
+Sol ran the evaluator.
+They looked at the score, compared it to the last run, and decided what to try next.
+
+The next week they tested learning rates.
+A lower rate was calm but slow.
+A higher rate moved fast but sometimes missed the good path.
+They learned to write simple hypotheses before they launched a run.
+They learned to stop a bad run early, save the artifact, and keep the ledger honest.
+
+Later they trained on a story about a lamp in a rainy kitchen.
+The lamp glowed on a wet table while tea steamed by the window.
+Two children counted the drops on the glass and made up songs about the storm.
+The song was short, bright, and easy to remember.
+That was enough for a tiny model to learn something real from a tiny corpus.
+
+Mina and Sol never tried to hide rough edges with big words.
+If a script only worked on one machine, they said so.
+If a dataset needed a license note, they wrote one.
+If a path was optional, they marked it optional.
+Their rule was simple: ship the smallest thing that actually works.
+
+By spring they had a little lab they could explain to anyone.
+A user could launch one run, stop it safely, inspect the board, and score a checkpoint.
+The ledger stayed short.
+The commands stayed direct.
+The machine stayed calm.
